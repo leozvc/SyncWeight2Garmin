@@ -11,13 +11,21 @@ from Crypto.Cipher import PKCS1_v1_5
 import os
 
 class WeightSync:
-    def __init__(self):
+    def __init__(self, region="cn"):
         self.yunmai_base_url = "http://intl.yunmai.com/app/"
-        self.garmin_base_url = "https://cn.garmin.com/api/"
-        self.token_file = "yunmai_token.json"  # 用于存储token的文件
+        self.region = region  # 保存region参数
+        # 根据地区选择佳明API地址
+        if region == "cn":
+            self.garmin_base_url = "https://cn.garmin.com/modern/weight/"
+        else:
+            self.garmin_base_url = "https://connect.garmin.com/modern/weight/"
+        self.token_file = "yunmai_token.json"
         
     def encrypt_account_password(self, account, password):
         """使用RSA加密账号密码"""
+        if not account or not password:
+            raise ValueError("账号和密码不能为空")
+        
         account_b64 = base64.b64encode(account.encode()).decode()
         account_URI = urllib.parse.quote(account_b64)
 
@@ -57,7 +65,7 @@ class WeightSync:
             with open(self.token_file, 'r') as f:
                 token_data = json.load(f)
             
-            # 验证token是否属于当前用户
+            # 验证token是否属于前用户
             if token_data.get("phone") != phone:
                 return None, None
             
@@ -70,7 +78,83 @@ class WeightSync:
             print(f"加载token失败: {str(e)}")
             return None, None
 
-    def get_yunmai_data(self, phone, password):
+    def get_weight_data(self, session, headers, code, user_id, access_token, start_time=None, end_time=None):
+        """获取体重数据的独立方法"""
+        try:
+            # 如果没有指定开始时间，默认获取近一年的数据
+            if start_time is None:
+                start_time = str(int(time.time()) - 365 * 24 * 60 * 60)
+            
+            weight_url = "https://data.iyunmai.com/api/android/scale/list.json"
+            
+            weight_sign = f"code={code}&signVersion=3&startTime={start_time}&userId={user_id}&versionCode=2&secret=AUMtyBDV3vklBr6wtA2putAMwtmVcD5b"
+            sign = hashlib.md5(weight_sign.encode()).hexdigest()
+            
+            weight_params = {
+                "code": code,
+                "signVersion": "3",
+                "startTime": start_time,
+                "userId": user_id,
+                "versionCode": "2",
+                "sign": sign
+            }
+            
+            headers["accessToken"] = access_token
+            weight_resp = session.get(
+                weight_url,
+                params=weight_params,
+                headers=headers,
+                timeout=10
+            )
+            
+            print(f"获取体重数据URL: {weight_resp.url}")
+            print(f"获取体重数据响应状态码: {weight_resp.status_code}")
+            
+            weight_json = weight_resp.json()
+            if weight_json.get("result", {}).get("code") != 0:
+                print(f"获取体重数据失败: {weight_json.get('result', {}).get('msg')}")
+                return None
+                
+            # 转换数据格式
+            weight_list = []
+            for item in weight_json["data"]["rows"]:
+                try:
+                    measure_time = int(item["timeStamp"])
+                    # 如果指定了结束时间，跳过超出范围的数据
+                    if end_time and measure_time > int(end_time):
+                        continue
+                        
+                    weight = float(item["weight"])
+                    height = float(item.get("height", 170)) / 100  # ��高，默认170cm
+                    
+                    # 计算各项指标
+                    weight_list.append({
+                        "measureTime": measure_time,
+                        "weight": weight,
+                        "bodyFat": float(item.get("fat", 0)),  # 体脂率
+                        "bodyWater": float(item.get("water", 0)),  # 水分率
+                        "muscleMass": float(item.get("muscle", 0)),  # 肌肉量
+                        "boneMass": float(item.get("bone", 0)),  # 骨量
+                        "bmr": float(item.get("bmr", 0)),  # 基础代谢
+                        "protein": float(item.get("protein", 0)),  # 蛋白质
+                        "bodyAge": float(item.get("bodyAge", 0)),  # 体年龄
+                        "visceralFat": float(item.get("visFat", 0)),  # 内脏脂肪等级
+                        "bmi": round(weight / (height * height), 1),  # BMI
+                        "bodyShape": int(item.get("bodyShape", 0)),  # 体型
+                        "fatMass": round(weight * float(item.get("fat", 0)) / 100, 2),  # 脂肪量
+                        "muscleMassWeight": round(weight * float(item.get("muscle", 0)) / 100, 2),  # 肌肉重量
+                    })
+                except (KeyError, ValueError) as e:
+                    print(f"解析记录时出错，跳过此条记录: {str(e)}")
+                    continue
+            
+            return weight_list
+            
+        except Exception as e:
+            print(f"获取体重数据异常: {str(e)}")
+            return None
+
+    def get_yunmai_data(self, phone, password, start_time=None, end_time=None):
         """从云麦获取体重数据"""
         headers = {
             "Content-Type": "application/x-www-form-urlencoded",
@@ -89,7 +173,9 @@ class WeightSync:
         
         if refresh_token and user_id:
             print("使用缓存的refreshToken...")
-            # 尝试使用缓存的token
+            print(f"当前user_id: {user_id}")
+            # 尝试用缓存的token
+            # 尝试用缓存的token
             token_sign = f"code={code}&refreshToken={refresh_token}&signVersion=3&versionCode=2&secret=AUMtyBDV3vklBr6wtA2putAMwtmVcD5b"
             token_data = (
                 f"code={code}&refreshToken={refresh_token}&sign={hashlib.md5(token_sign.encode()).hexdigest()}"
@@ -97,6 +183,7 @@ class WeightSync:
             )
             
             try:
+                print("正在请求新的accessToken...")
                 token_resp = session.post(
                     "https://account.iyunmai.com/api/android/auth/token.d",
                     data=token_data,
@@ -104,26 +191,33 @@ class WeightSync:
                     timeout=10
                 )
                 
+                print(f"Token响应状态码: {token_resp.status_code}")
+                print(f"Token响应内容: {token_resp.text}")
+                
                 token_json = token_resp.json()
                 if token_json["result"]["code"] == 0:
                     access_token = token_json["data"]["accessToken"]
                     print("refreshToken有效，获取accessToken成功")
+                    # 将start_time和end_time传递给get_weight_data方法
+                    return self.get_weight_data(session, headers, code, user_id, access_token, start_time, end_time)
                 else:
                     print("refreshToken已失效，需要重新登录")
+                    try:
+                        os.remove(self.token_file)
+                    except:
+                        pass
                     refresh_token = None
             except Exception as e:
                 print(f"使用refreshToken获取accessToken失败: {str(e)}")
                 refresh_token = None
         
-        if not refresh_token:
-            print("开始云麦登录流程...")
-            # 原有的登录流程代码
-            deviceUUID = "abcd"
-            userId = "199999999"
-            
-            account_b64, account_URI, password_RSA, password_URI = self.encrypt_account_password(phone, password)
-            
-            print("\n=== 签名细节 ===")
+        # 只有在需要重新登录时才打印签名细节
+        print("开始云麦登录流程...")
+        deviceUUID = "abcd"
+        userId = "199999999"
+        
+        account_b64, account_URI, password_RSA, password_URI = self.encrypt_account_password(phone, password)
+        
         print("\n=== 签名细节 ===")
         print(f"手机号: {phone}")
         print(f"手机号Base64编码: {account_b64}")
@@ -190,6 +284,9 @@ class WeightSync:
             refresh_token = login_json["data"]["userinfo"]["refreshToken"]
             user_id = login_json["data"]["userinfo"]["userId"]
             
+            # 保存token到本地文件
+            self.save_token(phone, refresh_token, user_id)
+
             # 获取access token
             token_sign = f"code={code}&refreshToken={refresh_token}&signVersion=3&versionCode=2&secret=AUMtyBDV3vklBr6wtA2putAMwtmVcD5b"
             token_data = (
@@ -231,44 +328,7 @@ class WeightSync:
             access_token = token_json["data"]["accessToken"]
             
             # 获取体重数据
-            startTime = str(int(time.time()) - 9999 * 24 * 60 * 60)  # 获取较长时间范围的数据
-            weight_url = f"https://data.iyunmai.com/api/ios/scale/chart-list.json"
-            weight_params = {
-                "code": code,
-                "signVersion": "3",
-                "startTime": startTime,
-                "userId": user_id,
-                "versionCode": "2"
-            }
-            
-            headers["accessToken"] = access_token
-            weight_resp = session.get(
-                weight_url,
-                params=weight_params,
-                headers=headers,
-                timeout=10
-            )
-            
-            print(f"获取体重数据响应状态码: {weight_resp.status_code}")
-            print(f"获取体重数据响应内容: {weight_resp.text}")
-            
-            weight_json = weight_resp.json()
-            if weight_json.get("code") != 0:
-                print(f"获取体重数据失败: {weight_json.get('msg')}")
-                return None
-                
-            # 转换数据格式
-            weight_list = []
-            for item in weight_json["data"]["rows"]:
-                weight_list.append({
-                    "measureTime": int(item["createTime"]),
-                    "weight": float(item["weight"]),
-                    "bodyFat": float(item.get("bfr", 0)),
-                    "bodyWater": float(item.get("whr", 0)),
-                    "muscleMass": float(item.get("rom", 0))
-                })
-                
-            return weight_list
+            return self.get_weight_data(session, headers, code, user_id, access_token, start_time, end_time)
             
         except requests.exceptions.RequestException as e:
             print(f"网络请求错误: {str(e)}")
@@ -284,46 +344,68 @@ class WeightSync:
     def sync_to_garmin(self, weight_data, garmin_email, garmin_password):
         """同步数据到佳明"""
         try:
-            # 登录佳明
-            session = requests.Session()
-            login_resp = session.post(
-                f"{self.garmin_base_url}auth/login",
-                json={
-                    "email": garmin_email,
-                    "password": garmin_password
-                }
+            from garminconnect import (
+                Garmin,
+                GarminConnectConnectionError,
+                GarminConnectTooManyRequestsError,
+                GarminConnectAuthenticationError,
             )
-            
-            if login_resp.status_code != 200:
-                print("佳明登录失败")
+            from datetime import timezone, timedelta
+
+            # 创建Garmin客户端实例
+            try:
+                garmin_client = Garmin(garmin_email, garmin_password, is_cn=(self.region == "cn"))
+                garmin_client.login()
+                print(f"佳明（{'国内' if self.region == 'cn' else '国际'}）登录成功！")
+            except (
+                GarminConnectConnectionError,
+                GarminConnectAuthenticationError,
+                GarminConnectTooManyRequestsError,
+            ) as err:
+                print(f"佳明（{'国内' if self.region == 'cn' else '国际'}）登录失败: {err}")
                 return False
-                
-            # 转换并上传数据
+
+            # 上传数据
+            success_count = 0
             for record in weight_data:
-                weight_payload = {
-                    "dateTime": datetime.fromtimestamp(record["measureTime"]).strftime("%Y-%m-%d %H:%M:%S"),
-                    "weight": record["weight"],
-                    "bodyFat": record.get("bodyFat", 0),
-                    "bodyWater": record.get("bodyWater", 0),
-                    "muscleMass": record.get("muscleMass", 0)
-                }
-                
-                upload_resp = session.post(
-                    f"{self.garmin_base_url}weight",
-                    json=weight_payload
-                )
-                
-                if upload_resp.status_code == 200:
-                    print(f"成功同步体重记录: {weight_payload['dateTime']}")
-                else:
-                    print(f"同步失败: {weight_payload['dateTime']}")
+                try:
+                    # 转换时间戳为ISO格式
+                    dt = datetime.fromtimestamp(record["measureTime"], tz=timezone.utc)
+                    # 将时区调整为中国时区
+                    china_tz = timezone(timedelta(hours=8))
+                    dt_china = dt.astimezone(china_tz)
+                    iso_timestamp = dt_china.isoformat()
+
+                    # 准备体重数据
+                    garmin_client.add_body_composition(
+                        timestamp=iso_timestamp,
+                        weight=record["weight"],
+                        percent_fat=record.get("bodyFat", 0),
+                        percent_hydration=record.get("bodyWater", 0),
+                        visceral_fat_mass=record.get("fatMass", 0),  # 使用计算出的脂肪量
+                        bone_mass=record.get("boneMass", 0),  # 使用骨量数据
+                        muscle_mass=record.get("muscleMassWeight", 0),  # 使用计算出的肌肉重量
+                        basal_met=record.get("bmr", 0),  # 基础代谢
+                        physique_rating=record.get("bodyShape", 0),  # 体型评分
+                        metabolic_age=record.get("bodyAge", 0),  # 体年龄
+                        visceral_fat_rating=record.get("visceralFat", 0),  # 内脏脂肪等级
+                        bmi=record.get("bmi", 0)  # BMI
+                    )
                     
-                time.sleep(1)  # 避免请求过快
-                
-            return True
-            
+                    success_count += 1
+                    print(f"成功同步体重记录: {dt_china.strftime('%Y-%m-%d %H:%M:%S')}")
+                    time.sleep(1)  # 避免请求过快
+
+                except Exception as e:
+                    print(f"同步记录失败: {dt_china.strftime('%Y-%m-%d %H:%M:%S') if 'dt_china' in locals() else '未知时间'}")
+                    print(f"错误信息: {str(e)}")
+                    continue
+
+            print(f"同步完成，成功: {success_count}/{len(weight_data)}")
+            return success_count > 0
+
         except Exception as e:
-            print(f"��步到佳明失败: {str(e)}")
+            print(f"同步到佳明失败: {str(e)}")
             return False
 
 def main():
@@ -332,14 +414,27 @@ def main():
     parser.add_argument("--password", required=True, help="云麦账号密码")
     parser.add_argument("--garmin-email", required=True, help="佳明账号邮箱")
     parser.add_argument("--garmin-password", required=True, help="佳明账号密码")
+    parser.add_argument("--region", choices=["cn", "global"], default="cn", help="佳明账号区��，cn为中国区，global为国际区")
+    parser.add_argument("--start-date", help="开始日期，格式：YYYY-MM-DD")
+    parser.add_argument("--end-date", help="结束日期，格式：YYYY-MM-DD，不传则使用当前时间")
     
     args = parser.parse_args()
     
-    syncer = WeightSync()
+    # 转换日期为时间戳
+    start_time = None
+    end_time = None
+    if args.start_date:
+        start_time = int(datetime.strptime(args.start_date, "%Y-%m-%d").timestamp())
+    if args.end_date:
+        end_time = int(datetime.strptime(args.end_date, "%Y-%m-%d").timestamp()) + 24*60*60  # 加一天
+    else:
+        end_time = int(time.time())  # 使用当前时间作为结束时间
+    
+    syncer = WeightSync(region=args.region)
     
     # 获取云麦数据
     print("正在获取云麦数据...")
-    weight_data = syncer.get_yunmai_data(args.phone, args.password)
+    weight_data = syncer.get_yunmai_data(args.phone, args.password, start_time, end_time)
     
     if not weight_data:
         print("获取云麦数据失败")
